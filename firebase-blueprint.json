@@ -1,0 +1,81 @@
+{
+  "entities": {
+    "User": {
+      "collection": "users",
+      "fields": {
+        "id": { "type": "string", "description": "User ID matching Firebase Auth UID" },
+        "email": { "type": "string", "description": "User email address" },
+        "displayName": { "type": "string", "description": "Display name of user" },
+        "balanceUsd": { "type": "number", "description": "Current virtual paper balance" },
+        "initialBalanceUsd": { "type": "number", "description": "Initial virtual paper balance" },
+        "equityUsd": { "type": "number", "description": "Total virtual equity including open PnL" },
+        "totalRealizedPnlUsd": { "type": "number", "description": "Lifetime realized profit/loss in USD" },
+        "winCount": { "type": "number", "description": "Total winning trades" },
+        "lossCount": { "type": "number", "description": "Total losing trades" },
+        "totalTrades": { "type": "number", "description": "Total closed trades" },
+        "autoTraderActive": { "type": "boolean", "description": "Whether autonomous auto-trader mode is active" },
+        "autoTraderMinConfidence": { "type": "number", "description": "Minimum multi-agent confidence threshold" },
+        "autoTraderDefaultLeverage": { "type": "number", "description": "Default leverage multiplier (e.g. 3)" },
+        "autoTraderPositionSizeUsd": { "type": "number", "description": "Default margin size per trade in USD" },
+        "updatedAt": { "type": "number", "description": "Timestamp of last update" }
+      }
+    },
+    "Position": {
+      "collection": "users/{userId}/positions",
+      "fields": {
+        "id": { "type": "string", "description": "Unique position ID" },
+        "symbol": { "type": "string", "description": "Trading pair symbol (e.g. BTCUSDT)" },
+        "side": { "type": "string", "description": "LONG or SHORT" },
+        "entryPrice": { "type": "number", "description": "Entry price" },
+        "currentPrice": { "type": "number", "description": "Last mark price" },
+        "leverage": { "type": "number", "description": "Leverage (e.g. 3)" },
+        "marginUsd": { "type": "number", "description": "Margin allocated in USD" },
+        "sizeUsd": { "type": "number", "description": "Total notional position size in USD" },
+        "stopLoss": { "type": "number", "description": "Stop loss price level" },
+        "takeProfit1": { "type": "number", "description": "First take profit target price" },
+        "takeProfit2": { "type": "number", "description": "Second take profit target price" },
+        "liquidationPrice": { "type": "number", "description": "Estimated liquidation price" },
+        "unrealizedPnlUsd": { "type": "number", "description": "Current unrealized PnL in USD" },
+        "unrealizedPnlPercent": { "type": "number", "description": "Current unrealized PnL in percent" },
+        "openTime": { "type": "number", "description": "Timestamp when position was opened" },
+        "agentConsensus": { "type": "string", "description": "Agent consensus score" },
+        "confidence": { "type": "number", "description": "Confidence percentage when opened" }
+      }
+    },
+    "ClosedTrade": {
+      "collection": "users/{userId}/trades",
+      "fields": {
+        "id": { "type": "string", "description": "Unique trade record ID" },
+        "symbol": { "type": "string", "description": "Trading pair symbol" },
+        "side": { "type": "string", "description": "LONG or SHORT" },
+        "entryPrice": { "type": "number", "description": "Execution entry price" },
+        "exitPrice": { "type": "number", "description": "Execution exit price" },
+        "leverage": { "type": "number", "description": "Leverage multiplier used" },
+        "sizeUsd": { "type": "number", "description": "Total notional size in USD" },
+        "marginUsd": { "type": "number", "description": "Margin used in USD" },
+        "pnlUsd": { "type": "number", "description": "Realized PnL in USD" },
+        "pnlPercent": { "type": "number", "description": "Realized PnL in percent" },
+        "openTime": { "type": "number", "description": "Open timestamp" },
+        "closeTime": { "type": "number", "description": "Close timestamp" },
+        "closeReason": { "type": "string", "description": "Reason for closing (TAKE_PROFIT_1, STOP_LOSS, MANUAL, etc)" },
+        "agentConsensus": { "type": "string", "description": "Consensus description at open" }
+      }
+    },
+    "NewsSignal": {
+      "collection": "news_signals",
+      "fields": {
+        "id": { "type": "string", "description": "Unique news digest ID" },
+        "symbol": { "type": "string", "description": "Crypto symbol" },
+        "headline": { "type": "string", "description": "Key breaking macro / crypto headline" },
+        "sentiment": { "type": "string", "description": "BULLISH, BEARISH, or NEUTRAL" },
+        "sentimentScore": { "type": "number", "description": "Score from -100 to +100" },
+        "impactLevel": { "type": "string", "description": "HIGH, MEDIUM, LOW" },
+        "summary": { "type": "string", "description": "Concise synthesis of recent news and catalysts" },
+        "keyCatalysts": { "type": "array", "description": "List of key catalysts identified" },
+        "sources": { "type": "array", "description": "List of web sources with title and URL" },
+        "searchQueries": { "type": "array", "description": "Google search queries used" },
+        "timestamp": { "type": "number", "description": "Timestamp when generated" }
+      }
+    }
+  }
+}

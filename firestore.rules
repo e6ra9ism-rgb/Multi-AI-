@@ -1,0 +1,23 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Users can read and write their own data
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      
+      match /positions/{positionId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      match /trades/{tradeId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+    }
+    
+    // Shared public news & market sentiment signals
+    match /news_signals/{signalId} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+  }
+}

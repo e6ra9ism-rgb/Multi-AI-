@@ -1,0 +1,1483 @@
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { 
+  Candle, 
+  ColorPreset, 
+  HeatmapData, 
+  LeverageFilter, 
+  LiquidationEvent, 
+  OrderBook, 
+  TickerData, 
+  Venue, 
+  Timeframe, 
+  ScalpSignal, 
+  DualExchangeTicker, 
+  DualExchangeDepth,
+  MultiAgentTradeSignal,
+  PaperPosition,
+  ClosedTrade,
+  TraderAccount,
+  CryptoNewsSignal,
+  UserAuthProfile,
+  TruthAISignal,
+  PriceActionSignal,
+  DominantTimeframeAnalysis,
+  BitunixAccountInfo,
+  BitunixRealPosition,
+  BitunixOrderResponse,
+  BitunixPlaceOrderParams
+} from './types';
+import { marketApi, SUPPORTED_SYMBOLS } from './services/marketApi';
+import { computeLiquidityHeatmap } from './utils/heatmapEngine';
+import { HeatmapChart } from './components/HeatmapChart';
+import { MultiAgentTraderModal } from './components/MultiAgentTraderModal';
+import { TruthAICard } from './components/TruthAICard';
+import { 
+  auth, 
+  signInWithGoogle, 
+  logOut, 
+  saveUserAccount, 
+  loadUserAccount, 
+  savePositionToFirestore, 
+  removePositionFromFirestore, 
+  saveClosedTradeToFirestore, 
+  saveNewsSignalToFirestore, 
+  subscribeToPositions, 
+  subscribeToClosedTrades 
+} from './lib/firebase';
+import { onAuthStateChanged } from 'firebase/auth';
+
+const computeWeightedImbalance = (orderBook: any, dualDepth: any, dualTicker: any) => {
+  let orderBookImbalance = 1.0;
+  if (dualDepth && dualTicker) {
+    const bBids = (dualDepth.binance?.bids || []).reduce((acc: any, b: any) => acc + b.size, 0);
+    const bAsks = (dualDepth.binance?.asks || []).reduce((acc: any, a: any) => acc + a.size, 0);
+    const bImbalance = bAsks > 0 ? bBids / bAsks : 1.0;
+    const bOI = dualTicker.binance?.openInterestUsd || 1000000;
+
+    const hlBids = (dualDepth.hyperliquid?.bids || []).reduce((acc: any, b: any) => acc + b.size, 0);
+    const hlAsks = (dualDepth.hyperliquid?.asks || []).reduce((acc: any, a: any) => acc + a.size, 0);
+    const hlImbalance = hlAsks > 0 ? hlBids / hlAsks : 1.0;
+    const hlOI = dualTicker.hyperliquid?.openInterestUsd || 1000000;
+
+    const totalOI = bOI + hlOI;
+    orderBookImbalance = ((bImbalance * bOI) + (hlImbalance * hlOI)) / (totalOI || 1);
+  } else {
+    const totalBids = (orderBook.bids || []).reduce((acc: any, b: any) => acc + b.size, 0);
+    const totalAsks = (orderBook.asks || []).reduce((acc: any, a: any) => acc + a.size, 0);
+    orderBookImbalance = totalAsks > 0 ? totalBids / totalAsks : 1.0;
+  }
+  return orderBookImbalance;
+};
+
+const extractTopClusters = (heatmapData: any, curPrice: number) => {
+  if (!heatmapData || !heatmapData.cumulativeDepthByPrice) return [];
+  return [...heatmapData.cumulativeDepthByPrice]
+    .filter((c: any) => c.liqVolume > 0)
+    .sort((a: any, b: any) => b.liqVolume - a.liqVolume)
+    .slice(0, 10)
+    .map((c: any) => ({
+      price: c.price,
+      side: c.price > curPrice ? 'SHORT_LIQ' : 'LONG_LIQ',
+      volumeUsd: c.liqVolume,
+      intensity: c.liqVolume / (heatmapData.maxIntensity || 1),
+      clusterAgeMinutes: c.clusterAgeMinutes,
+      phantomLiquidityRisk: c.phantomLiquidityRisk
+    }));
+};
+
+export default function App() {
+  const [symbol, setSymbol] = useState<string>('BTCUSDT');
+  const [venue, setVenue] = useState<Venue>('aggregated');
+  const [interval, setInterval] = useState<Timeframe>('5m');
+  
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const [orderBook, setOrderBook] = useState<OrderBook>({ bids: [], asks: [] });
+  const [ticker, setTicker] = useState<TickerData | null>(null);
+  const [dualTicker, setDualTicker] = useState<DualExchangeTicker | null>(null);
+  const [dualDepth, setDualDepth] = useState<DualExchangeDepth | null>(null);
+  const [liquidations, setLiquidations] = useState<LiquidationEvent[]>([]);
+  const [heatmapData, setHeatmapData] = useState<HeatmapData | null>(null);
+
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [latencyMs, setLatencyMs] = useState<number>(38);
+
+  // Firebase Auth State & Cloud Sync
+  const [userProfile, setUserProfile] = useState<UserAuthProfile | null>(null);
+  const [firestoreStatus, setFirestoreStatus] = useState<'connected' | 'syncing' | 'offline'>('connected');
+
+  // AI Scalper State (Gemini 3.7 Flash)
+  const [scalpSignal, setScalpSignal] = useState<ScalpSignal | null>(null);
+  const [isScalpLoading, setIsScalpLoading] = useState<boolean>(false);
+  const [scalpError, setScalpError] = useState<string | null>(null);
+  const [showScalpCard, setShowScalpCard] = useState<boolean>(false);
+  const [showScalpOverlay, setShowScalpOverlay] = useState<boolean>(true);
+
+  // 3X Multi-Agent Trader State (5-Agent Council: Truth AI, Aethelgard, Valkyrie, Delphi, Cerberus)
+  const [multiAgentSignal, setMultiAgentSignal] = useState<MultiAgentTradeSignal | null>(null);
+  const [isMultiAgentLoading, setIsMultiAgentLoading] = useState<boolean>(false);
+  const [multiAgentError, setMultiAgentError] = useState<string | null>(null);
+  const [showMultiAgentModal, setShowMultiAgentModal] = useState<boolean>(false);
+
+  // News Agent State (Agent Delphi - Google Search Grounded)
+  const [newsSignal, setNewsSignal] = useState<CryptoNewsSignal | null>(null);
+  const [isNewsLoading, setIsNewsLoading] = useState<boolean>(false);
+
+  // Truth AI State (Macro Realist & Bear Market Reality Anchor)
+  const [truthSignal, setTruthSignal] = useState<TruthAISignal | null>(null);
+  const [isTruthLoading, setIsTruthLoading] = useState<boolean>(false);
+  const [truthError, setTruthError] = useState<string | null>(null);
+  const [showTruthCard, setShowTruthCard] = useState<boolean>(false);
+
+  // Price Action Master (Return to Pivot & Market Structure Master)
+  const [priceActionSignal, setPriceActionSignal] = useState<PriceActionSignal | null>(null);
+  const [isPriceActionLoading, setIsPriceActionLoading] = useState<boolean>(false);
+  const [priceActionError, setPriceActionError] = useState<string | null>(null);
+  const [showPriceActionCard, setShowPriceActionCard] = useState<boolean>(false);
+  const [showPriceActionOverlay, setShowPriceActionOverlay] = useState<boolean>(true);
+
+  // Dominant Timeframe Reaction & Multi-Timeframe Alignment State
+  const [dominantTfData, setDominantTfData] = useState<DominantTimeframeAnalysis | null>(null);
+  const [isDominantTfLoading, setIsDominantTfLoading] = useState<boolean>(false);
+
+  // Paper & Bitunix Real Trading Account & Positions
+  const [account, setAccount] = useState<TraderAccount>({
+    balanceUsd: 100000,
+    initialBalanceUsd: 100000,
+    equityUsd: 100000,
+    totalRealizedPnlUsd: 0,
+    winCount: 0,
+    lossCount: 0,
+    totalTrades: 0,
+    autoTraderActive: false,
+    autoTraderMinConfidence: 85,
+    autoTraderDefaultLeverage: 100, // 100X default leverage
+    autoTraderPositionSizeUsd: 10, // $10 default margin size
+    autoTraderIntervalMinutes: 5, // Runs every 5 min after candle close
+    lastProcessedCandleTime: 0,
+    telegramBotToken: '',
+    telegramChatId: '',
+    telegramNotificationsEnabled: false,
+    telegramAutoTradeExecutedOnly: false,
+    executionMode: 'BITUNIX_REAL',
+    bitunixApiKey: '',
+    bitunixSecretKey: '',
+    bitunixConnected: false,
+    bitunixBalanceUsd: 0,
+    bitunixAvailableBalanceUsd: 0,
+  });
+
+    const [closedTrades, setClosedTrades] = useState<ClosedTrade[]>([]);
+  const [livePrices, setLivePrices] = useState<Record<string, number>>({});
+
+  // Bitunix Real Exchange States
+  const [bitunixAccountInfo, setBitunixAccountInfo] = useState<BitunixAccountInfo | null>(null);
+  const [bitunixPositions, setBitunixPositions] = useState<BitunixRealPosition[]>([]);
+  const [isBitunixSyncing, setIsBitunixSyncing] = useState<boolean>(false);
+
+  // Display toggles matching CoinGlass Legend
+  const [colorPreset, setColorPreset] = useState<ColorPreset>('coinglass');
+  const [intensitySensitivity, setIntensitySensitivity] = useState<number>(1.0);
+  const [leverageFilter, setLeverageFilter] = useState<LeverageFilter>('all');
+  const [showHeatmap, setShowHeatmap] = useState<boolean>(true);
+  const [showCandles, setShowCandles] = useState<boolean>(true);
+  const [showDepthProfile, setShowDepthProfile] = useState<boolean>(true);
+  const [showVolumeProfile, setShowVolumeProfile] = useState<boolean>(true);
+
+  const isMountedRef = useRef(true);
+  const candlesRef = useRef(candles);
+  candlesRef.current = candles;
+  const tickerRef = useRef(ticker);
+  tickerRef.current = ticker;
+  const livePricesRef = useRef(livePrices);
+  livePricesRef.current = livePrices;
+      const accountRef = useRef(account);
+  accountRef.current = account;
+  const heatmapDataRef = useRef<HeatmapData | null>(null);
+  heatmapDataRef.current = heatmapData;
+  const isAutoEvaluatingRef = useRef(false);
+  const lastEvaluatedCandleCloseRef = useRef<number>(0);
+
+  // 1. Firebase Auth listener & local guest session fallback
+  useEffect(() => {
+    // Load local paper trading data for guests
+    try {
+      const savedLocalAcc = localStorage.getItem('quant_trader_account');
+      if (savedLocalAcc) {
+        setAccount((prev) => ({ ...prev, ...JSON.parse(savedLocalAcc) }));
+      }
+      const savedLocalPos = localStorage.getItem('quant_active_positions');
+      if (savedLocalPos) {
+        setActivePositions(JSON.parse(savedLocalPos));
+      }
+      const savedLocalTrades = localStorage.getItem('quant_closed_trades');
+      if (savedLocalTrades) {
+        setClosedTrades(JSON.parse(savedLocalTrades));
+      }
+    } catch (e) {
+      console.warn('Local storage load warning:', e);
+    }
+
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setUserProfile({
+          uid: user.uid,
+          email: user.email,
+          displayName: user.displayName || 'Quant Trader',
+          photoURL: user.photoURL,
+          isAnonymous: user.isAnonymous,
+        });
+
+        // Load persisted account data from Firestore
+        const savedAccount = await loadUserAccount(user.uid);
+        if (savedAccount) {
+          setAccount((prev) => ({ ...prev, ...savedAccount }));
+        }
+      } else {
+        setUserProfile(null);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Real-time Firestore Subscriptions for User's Positions and Trades
+  useEffect(() => {
+    if (!userProfile?.uid) return;
+
+    setFirestoreStatus('syncing');
+
+    const unsubPositions = subscribeToPositions(userProfile.uid, (cloudPositions) => {
+      setActivePositions(cloudPositions || []);
+      setFirestoreStatus('connected');
+    });
+
+    const unsubTrades = subscribeToClosedTrades(userProfile.uid, (cloudTrades) => {
+      setClosedTrades(cloudTrades || []);
+      setFirestoreStatus('connected');
+    });
+
+    return () => {
+      unsubPositions();
+      unsubTrades();
+    };
+  }, [userProfile?.uid]);
+
+  // Sync to local storage for guest session persistence
+  useEffect(() => {
+    try {
+      localStorage.setItem('quant_trader_account', JSON.stringify(account));
+    } catch (e) {
+      // ignore
+    }
+  }, [account]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('quant_active_positions', JSON.stringify(activePositions));
+    } catch (e) {
+      // ignore
+    }
+  }, [activePositions]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('quant_closed_trades', JSON.stringify(closedTrades));
+    } catch (e) {
+      // ignore
+    }
+  }, [closedTrades]);
+
+  // Handle Google Sign-in
+  const handleSignInGoogle = async () => {
+    try {
+      setFirestoreStatus('syncing');
+      await signInWithGoogle();
+      setFirestoreStatus('connected');
+    } catch (err: any) {
+      console.error('Google Sign-in failed:', err);
+    }
+  };
+
+  // Handle Sign-out
+  const handleSignOut = async () => {
+    try {
+      await logOut();
+      setUserProfile(null);
+    } catch (err) {
+      console.error('Sign-out error:', err);
+    }
+  };
+
+  // Fetch News Agent (Agent Delphi) Grounded via Google Search
+  const handleFetchCryptoNews = useCallback(async (targetSymbol: string) => {
+    setIsNewsLoading(true);
+    try {
+      const curPrice = tickerRef.current?.lastPrice || candlesRef.current[candlesRef.current.length - 1]?.close || 0;
+      const news = await marketApi.fetchCryptoNews(targetSymbol, curPrice);
+      if (isMountedRef.current) {
+        setNewsSignal(news);
+        saveNewsSignalToFirestore(news);
+      }
+      return news;
+    } catch (err) {
+      console.warn('Crypto news search error:', err);
+      return null;
+    } finally {
+      if (isMountedRef.current) {
+        setIsNewsLoading(false);
+      }
+    }
+  }, []);
+
+  // Automatically fetch news on symbol change
+  useEffect(() => {
+    handleFetchCryptoNews(symbol);
+  }, [symbol, handleFetchCryptoNews]);
+
+  // Trigger real-time Gemini 3.7 Flash AI Scalping Setup with Dual-Exchange Cross Microstructure
+  const handleRequestScalpSignal = useCallback(async () => {
+    setIsScalpLoading(true);
+    setScalpError(null);
+    setShowScalpCard(true);
+
+    try {
+      const curPrice = ticker?.lastPrice || candles[candles.length - 1]?.close || 0;
+      const topClusters = extractTopClusters(heatmapData, curPrice);
+      const orderBookImbalance = computeWeightedImbalance(orderBook, dualDepth, dualTicker);
+
+      const signal = await marketApi.fetchScalpSignal({
+        symbol,
+        lastPrice: curPrice,
+        fundingRate: ticker?.fundingRate || 0.0001,
+        openInterestUsd: ticker?.openInterestUsd || 1000000000,
+        priceChange24h: ticker?.priceChangePercent || 0,
+        interval,
+        recentCandles: candles.slice(-15),
+        orderBookImbalance,
+        topLiquidationClusters: topClusters,
+        binanceData: dualTicker?.binance || null,
+        hyperliquidData: dualTicker?.hyperliquid || null,
+        crossExchangeSpread: dualTicker?.spreadUsd || 0,
+      });
+
+      if (isMountedRef.current) {
+        setScalpSignal(signal);
+      }
+    } catch (err: any) {
+      console.error('Scalper error:', err);
+      if (isMountedRef.current) {
+        setScalpError(err.message || 'Failed to generate AI scalp setup. Please ensure GEMINI_API_KEY is configured.');
+      }
+    } finally {
+      if (isMountedRef.current) {
+        setIsScalpLoading(false);
+      }
+    }
+  }, [symbol, interval, ticker, candles, heatmapData, orderBook, dualTicker]);
+
+  // Request Truth AI Reality Anchor & Bear Market Regime Analysis
+  const handleRequestTruthAISignal = useCallback(async () => {
+    setIsTruthLoading(true);
+    setTruthError(null);
+
+    try {
+      const curPrice = ticker?.lastPrice || candles[candles.length - 1]?.close || 0;
+      const topClusters = extractTopClusters(heatmapData, curPrice);
+      const orderBookImbalance = computeWeightedImbalance(orderBook, dualDepth, dualTicker);
+
+      const symbolObj = SUPPORTED_SYMBOLS.find(s => s.symbol === symbol);
+
+      const activeNews = newsSignal || await handleFetchCryptoNews(symbol);
+
+      const truth = await marketApi.fetchTruthAISignal({
+        symbol,
+        lastPrice: curPrice,
+        fundingRate: ticker?.fundingRate || 0.0001,
+        openInterestUsd: ticker?.openInterestUsd || 1000000000,
+        priceChange24h: ticker?.priceChangePercent || 0,
+        interval,
+        recentCandles: candles.slice(-15),
+        orderBookImbalance,
+        topLiquidationClusters: topClusters,
+        binanceData: dualTicker?.binance || null,
+        hyperliquidData: dualTicker?.hyperliquid || null,
+        crossExchangeSpread: dualTicker?.spreadUsd || 0,
+        coinName: symbolObj?.name || symbol,
+        newsContext: activeNews || null,
+      });
+
+      if (isMountedRef.current) {
+        setTruthSignal(truth);
+      }
+    } catch (err: any) {
+      console.error('Truth AI error:', err);
+      if (isMountedRef.current) {
+        setTruthError(err.message || 'Failed to generate Truth AI directive.');
+      }
+    } finally {
+      if (isMountedRef.current) {
+        setIsTruthLoading(false);
+      }
+    }
+  }, [symbol, interval, ticker, candles, heatmapData, orderBook, dualTicker, newsSignal, handleFetchCryptoNews]);
+
+  // Request Price Action Master (Return to Pivot & Market Structure Analysis)
+  const handleRequestPriceActionSignal = useCallback(async () => {
+    setIsPriceActionLoading(true);
+    setPriceActionError(null);
+
+    try {
+      const curPrice = ticker?.lastPrice || candles[candles.length - 1]?.close || 0;
+      
+      const topClusters = extractTopClusters(heatmapData, curPrice);
+      const orderBookImbalance = computeWeightedImbalance(orderBook, dualDepth, dualTicker);
+
+      const symbolObj = SUPPORTED_SYMBOLS.find(s => s.symbol === symbol);
+
+      const paSignal = await marketApi.fetchPriceActionSignal({
+        symbol,
+        lastPrice: curPrice,
+        fundingRate: ticker?.fundingRate || 0.0001,
+        openInterestUsd: ticker?.openInterestUsd || 1000000000,
+        priceChange24h: ticker?.priceChangePercent || 0,
+        interval,
+        recentCandles: candles.slice(-20),
+        orderBookImbalance,
+        topLiquidationClusters: topClusters,
+        binanceData: dualTicker?.binance || null,
+        hyperliquidData: dualTicker?.hyperliquid || null,
+        crossExchangeSpread: dualTicker?.spreadUsd || 0,
+        coinName: symbolObj?.name || symbol,
+      });
+
+      if (isMountedRef.current) {
+        setPriceActionSignal(paSignal);
+      }
+    } catch (err: any) {
+      console.error('Price Action AI error:', err);
+      if (isMountedRef.current) {
+        setPriceActionError(err.message || 'Failed to generate Price Action Master analysis.');
+      }
+    } finally {
+      if (isMountedRef.current) {
+        setIsPriceActionLoading(false);
+      }
+    }
+  }, [symbol, interval, ticker, candles, heatmapData, orderBook, dualTicker]);
+
+  // Request Dominant Timeframe Reaction & Multi-Timeframe Alignment Analysis
+  const handleRequestDominantTf = useCallback(async () => {
+    setIsDominantTfLoading(true);
+
+    try {
+      const curPrice = ticker?.lastPrice || candles[candles.length - 1]?.close || 0;
+      
+      const topClusters = extractTopClusters(heatmapData, curPrice);
+      const orderBookImbalance = computeWeightedImbalance(orderBook, dualDepth, dualTicker);
+
+      const analysis = await marketApi.fetchDominantTimeframeAnalysis({
+        symbol,
+        lastPrice: curPrice,
+        openInterestUsd: ticker?.openInterestUsd || 1000000000,
+        priceChange24h: ticker?.priceChangePercent || 0,
+        recentCandles: candles.slice(-20),
+        orderBookImbalance,
+        topLiquidationClusters: topClusters,
+        binanceData: dualTicker?.binance || null,
+        hyperliquidData: dualTicker?.hyperliquid || null,
+        crossExchangeSpread: dualTicker?.spreadUsd || 0,
+        activeInterval: interval,
+      });
+
+      if (isMountedRef.current) {
+        setDominantTfData(analysis);
+      }
+    } catch (err: any) {
+      console.error('Dominant Timeframe Analysis error:', err);
+    } finally {
+      if (isMountedRef.current) {
+        setIsDominantTfLoading(false);
+      }
+    }
+  }, [symbol, interval, ticker, candles, heatmapData, orderBook, dualTicker]);
+
+  // Bitunix Real Exchange Sync Handler
+  const handleBitunixSync = useCallback(async (apiKey?: string, secretKey?: string) => {
+    setIsBitunixSyncing(true);
+    try {
+      const key = apiKey || accountRef.current.bitunixApiKey;
+      const secret = secretKey || accountRef.current.bitunixSecretKey;
+      if (!key) {
+        setIsBitunixSyncing(false);
+        return;
+      }
+
+      const [accRes, posRes] = await Promise.all([
+        marketApi.fetchBitunixAccount({ apiKey: key, secretKey: secret }),
+        marketApi.fetchBitunixPositions({ apiKey: key, secretKey: secret }),
+      ]);
+
+      if (accRes.success && accRes.data) {
+        setBitunixAccountInfo(accRes.data);
+        setAccount((prev) => {
+          const updated = {
+            ...prev,
+            bitunixConnected: true,
+            bitunixBalanceUsd: accRes.data?.totalEquityUsd || 0,
+            bitunixAvailableBalanceUsd: accRes.data?.availableBalanceUsd || 0,
+          };
+          if (userProfile?.uid) {
+            saveUserAccount(userProfile.uid, updated, { email: userProfile.email, displayName: userProfile.displayName });
+          }
+          return updated;
+        });
+      }
+
+      if (posRes.success && Array.isArray(posRes.positions)) {
+        setBitunixPositions(posRes.positions);
+      }
+    } catch (err) {
+      console.warn('[Bitunix Sync Error]', err);
+    } finally {
+      setIsBitunixSyncing(false);
+    }
+  }, [userProfile]);
+
+  // Bitunix Real Order Placement Handler
+  const handleBitunixPlaceOrder = useCallback(async (params: BitunixPlaceOrderParams): Promise<BitunixOrderResponse> => {
+    const apiKey = params.apiKey || accountRef.current.bitunixApiKey;
+    const secretKey = params.secretKey || accountRef.current.bitunixSecretKey;
+
+    const res = await marketApi.placeBitunixOrder({
+      ...params,
+      apiKey,
+      secretKey,
+    });
+
+    if (res.success) {
+      // Send Telegram execution notification
+      if (accountRef.current.telegramNotificationsEnabled) {
+        const sideEmoji = params.side === 'LONG' ? '🟢 LONG' : '🔴 SHORT';
+        const orderTypeBadge = params.orderType === 'LIMIT' ? '🎯 LIMIT ORDER PLACED' : '⚡ MARKET ORDER EXECUTED';
+        const priceLabel = params.orderType === 'LIMIT' ? 'Limit Entry' : 'Fill Price';
+        const tgMsg = `⚡ <b>REAL BITUNIX 3X ORDER EXECUTED</b> ⚡
+<b>Asset:</b> #${params.symbol}
+<b>Action:</b> OPEN ${sideEmoji} ${params.leverage}X
+<b>Type:</b> ${orderTypeBadge}
+<b>Margin:</b> ${params.marginUsd?.toLocaleString()} (Notional: ${((params.marginUsd || 0) * (params.leverage || 3)).toLocaleString()})
+<b>${priceLabel}:</b> ${(params.price || 0).toLocaleString()}
+<b>Bitunix Order ID:</b> <code>${res.orderId || 'CONFIRMED'}</code>
+
+🎯 <b>TP1:</b> ${(params.takeProfit1 || 0).toLocaleString()} | <b>TP2:</b> ${(params.takeProfit2 || 0).toLocaleString()}
+🛑 <b>Stop Loss:</b> ${(params.stopLoss || 0).toLocaleString()}
+🔒 <b>Execution Protocol:</b> HMAC-SHA256 Signed Orderflow`;
+
+        marketApi.sendTelegramNotification({
+          botToken: accountRef.current.telegramBotToken,
+          chatId: accountRef.current.telegramChatId,
+          message: tgMsg,
+        }).catch((e) => console.log('[Telegram Bitunix Alert Error]', e.message));
+      }
+
+      // Refresh Bitunix account and positions
+      handleBitunixSync(apiKey, secretKey);
+    }
+
+    return res;
+  }, [handleBitunixSync]);
+
+  // Bitunix Real Position Flash-Close Handler
+  const handleBitunixClosePosition = useCallback(async (sym: string) => {
+    const apiKey = accountRef.current.bitunixApiKey;
+    const secretKey = accountRef.current.bitunixSecretKey;
+    await marketApi.closeBitunixPosition({
+      symbol: sym,
+      apiKey,
+      secretKey,
+    });
+    await handleBitunixSync(apiKey, secretKey);
+  }, [handleBitunixSync]);
+
+  // Request 3X Multi-Agent Quant Council Signal & Live Deliberation (incorporating Delphi's News & Multi-Timeframe Confirmation)
+  const handleRequestMultiAgentSignal = useCallback(async (overrideMtfPair?: any) => {
+    setIsMultiAgentLoading(true);
+    setMultiAgentError(null);
+
+    try {
+      const curPrice = ticker?.lastPrice || candles[candles.length - 1]?.close || 0;
+      
+      const topClusters = extractTopClusters(heatmapData, curPrice);
+      const orderBookImbalance = computeWeightedImbalance(orderBook, dualDepth, dualTicker);
+
+      // Pass existing or fresh newsContext and existing 3 AI signals into Master Synthesis deliberation
+      const activeNews = newsSignal || await handleFetchCryptoNews(symbol);
+
+      const mtfPairKey = (typeof overrideMtfPair === 'string' && overrideMtfPair.trim().length > 0)
+        ? overrideMtfPair.trim()
+        : 'H1_M15_M1';
+
+      // Calculate Fibonacci Levels for AI context
+      let swingHigh = -Infinity;
+      let swingLow = Infinity;
+      candles.slice(-100).forEach((c) => {
+        if (c.high > swingHigh) swingHigh = c.high;
+        if (c.low < swingLow) swingLow = c.low;
+      });
+      const diff = swingHigh - swingLow;
+      const fibonacciLevels = diff > 0 ? {
+        swingHigh,
+        swingLow,
+        fib0_382: swingLow + diff * 0.382,
+        fib0_500: swingLow + diff * 0.5,
+        fib0_618: swingLow + diff * 0.618,
+      } : null;
+
+      const multiSignal = await marketApi.fetchMultiAgentSignal({
+        symbol,
+        lastPrice: curPrice,
+        fundingRate: ticker?.fundingRate || 0.0001,
+        openInterestUsd: ticker?.openInterestUsd || 1000000000,
+        priceChange24h: ticker?.priceChangePercent || 0,
+        interval,
+        selectedMtfPair: mtfPairKey,
+        recentCandles: candles.slice(-15),
+        orderBookImbalance,
+        topLiquidationClusters: topClusters,
+        binanceData: dualTicker?.binance || null,
+        hyperliquidData: dualTicker?.hyperliquid || null,
+        crossExchangeSpread: dualTicker?.spreadUsd || 0,
+        defaultLeverage: account.autoTraderDefaultLeverage || 3,
+        newsContext: activeNews || undefined,
+        priceActionSignal: priceActionSignal || null,
+        truthSignal: truthSignal || null,
+        scalpSignal: scalpSignal || null,
+        dominantTfData: dominantTfData || null,
+        fibonacciLevels,
+      });
+
+      if (isMountedRef.current) {
+        setMultiAgentSignal(multiSignal);
+
+        // If Telegram alerts enabled for all new signals, send Telegram alert
+        if (
+          account.telegramNotificationsEnabled &&
+          !account.telegramAutoTradeExecutedOnly &&
+          multiSignal.consensusBias !== 'NEUTRAL'
+        ) {
+          const sideEmoji = multiSignal.consensusBias === 'LONG' ? '🟢 LONG' : '🔴 SHORT';
+          const mtfPairText = multiSignal.mtfConfirmation?.pair || 'H1 ➔ M5';
+          const mtfStatusText = multiSignal.mtfConfirmation?.confluenceStatus || '100% Full Confluence';
+          const htfLevelText = multiSignal.mtfConfirmation?.htfKeyLevel?.price ? `$${multiSignal.mtfConfirmation.htfKeyLevel.price.toLocaleString()}` : 'Key S&R Pivot';
+          const ltfTriggerText = multiSignal.mtfConfirmation?.ltfTrigger?.price ? `$${multiSignal.mtfConfirmation.ltfTrigger.price.toLocaleString()}` : 'MSS Return-to-Pivot';
+
+          const msg = `⚡ <b>3X MULTI-AGENT QUANT SIGNAL</b> ⚡
+<b>Asset:</b> #${symbol}
+<b>Consensus:</b> ${sideEmoji} (${multiSignal.consensusConfidence}% Conviction)
+<b>Triad Score:</b> ${multiSignal.consensusScore}
+<b>Recommended Leverage:</b> ${account.autoTraderDefaultLeverage || 100}X
+
+🌐 <b>Multi-Timeframe Confluence (${mtfPairText}):</b>
+• <b>Status:</b> ${mtfStatusText}
+• <b>HTF Key Level:</b> ${htfLevelText}
+• <b>LTF Entry Trigger:</b> ${ltfTriggerText}
+
+🎯 <b>Limit Entry Price:</b> $${(multiSignal.limitEntryPrice || multiSignal.entryPrice).toLocaleString()}
+🛑 <b>Stop Loss:</b> $${multiSignal.stopLoss.toLocaleString()}
+💰 <b>Take Profit 1:</b> $${multiSignal.takeProfit1.toLocaleString()}
+🔥 <b>Take Profit 2 (Liq):</b> $${multiSignal.takeProfit2.toLocaleString()}
+⚖️ <b>R:R Ratio:</b> ${multiSignal.riskRewardRatio} | Max Drawdown: ${multiSignal.maxExpectedDrawdownPercent}%
+
+🤖 <b>Master Synthesis Directive:</b>
+<i>${multiSignal.executiveSummary}</i>`;
+
+          marketApi.sendTelegramNotification({
+            botToken: account.telegramBotToken,
+            chatId: account.telegramChatId,
+            message: msg,
+          }).catch((e) => console.log('[Telegram Alert Error]', e.message));
+        }
+
+        // If Auto-Trader is enabled and confidence meets threshold, auto-execute trade
+        if (
+          account.autoTraderActive && 
+          multiSignal.consensusConfidence >= account.autoTraderMinConfidence &&
+          multiSignal.consensusBias !== 'NEUTRAL'
+        ) {
+          const existingPos = bitunixPositions.find((p) => p.symbol === symbol);
+          if (!existingPos) {
+            handleExecuteTrade({
+              symbol,
+              side: multiSignal.consensusBias === 'SHORT' ? 'SHORT' : 'LONG',
+              orderType: 'LIMIT',
+              limitPrice: multiSignal.limitEntryPrice || multiSignal.entryPrice,
+              leverage: account.autoTraderDefaultLeverage || 100,
+              marginUsd: account.bitunixConnected 
+                ? Math.min(account.autoTraderPositionSizeUsd || 10, Math.max(1, account.bitunixAvailableBalanceUsd * 0.95))
+                : (account.autoTraderPositionSizeUsd || 10),
+              entryPrice: multiSignal.entryPrice,
+              stopLoss: multiSignal.stopLoss,
+              takeProfit1: multiSignal.takeProfit1,
+              takeProfit2: multiSignal.takeProfit2,
+              consensusScore: multiSignal.consensusScore,
+              confidence: multiSignal.consensusConfidence,
+            });
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error('Multi-Agent Trader error:', err);
+      if (isMountedRef.current) {
+        setMultiAgentError(err.message || 'Failed to convene 5-Agent Council. Using quant analysis engine.');
+      }
+    } finally {
+      if (isMountedRef.current) {
+        setIsMultiAgentLoading(false);
+      }
+    }
+  }, [symbol, interval, ticker, candles, heatmapData, orderBook, dualTicker, account, activePositions, newsSignal, handleFetchCryptoNews]);
+
+  // Execute 3X Multi-Agent Trade into Virtual Portfolio & Cloud Firestore
+  const handleExecuteTrade = useCallback((params: {
+    symbol: string;
+    side: 'LONG' | 'SHORT';
+    orderType?: 'MARKET' | 'LIMIT';
+    limitPrice?: number;
+    leverage: number;
+    marginUsd: number;
+    entryPrice: number;
+    stopLoss: number;
+    takeProfit1: number;
+    takeProfit2: number;
+    consensusScore: string;
+    confidence: number;
+  }) => {
+    const curPrice =
+      (params.symbol === symbol ? ticker?.lastPrice : null) ||
+      livePricesRef.current[params.symbol] ||
+      params.entryPrice ||
+      0;
+    
+    // For LIMIT orders, use the requested limitPrice, otherwise current price
+    const executionPrice = params.orderType === 'LIMIT' && params.limitPrice ? params.limitPrice : curPrice;
+
+    const notional = params.marginUsd * params.leverage;
+
+    // Calculate approximate liquidation price based on leverage
+    const liqDistance = (executionPrice / params.leverage) * 0.95;
+    const liquidationPrice = params.side === 'LONG' 
+      ? Math.max(0, executionPrice - liqDistance)
+      : executionPrice + liqDistance;
+
+    const newPosition: PaperPosition = {
+      id: `pos_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      symbol: params.symbol,
+      side: params.side,
+      entryPrice: executionPrice,
+      currentPrice: curPrice,
+      leverage: params.leverage,
+      marginUsd: params.marginUsd,
+      sizeUsd: notional,
+      stopLoss: params.stopLoss,
+      takeProfit1: params.takeProfit1,
+      takeProfit2: params.takeProfit2,
+      liquidationPrice,
+      unrealizedPnlUsd: 0,
+      unrealizedPnlPercent: 0,
+      openTime: Date.now(),
+      agentConsensus: params.consensusScore,
+      confidence: params.confidence,
+    };
+
+    setActivePositions((prev) => [newPosition, ...prev]);
+    
+    setAccount((prev) => {
+      const updated = {
+        ...prev,
+        balanceUsd: Math.max(0, prev.balanceUsd - params.marginUsd),
+      };
+      if (userProfile?.uid) {
+        saveUserAccount(userProfile.uid, updated, { email: userProfile.email, displayName: userProfile.displayName });
+      }
+      return updated;
+    });
+
+    // Save to Firestore
+    if (userProfile?.uid) {
+      savePositionToFirestore(userProfile.uid, newPosition);
+    }
+
+    // Direct 3X Order Dispatch to Bitunix Real Futures Gateway
+    const apiKey = account.bitunixApiKey || accountRef.current.bitunixApiKey;
+    const secretKey = account.bitunixSecretKey || accountRef.current.bitunixSecretKey;
+    if (apiKey && secretKey) {
+      marketApi.placeBitunixOrder({
+        symbol: params.symbol,
+        side: params.side,
+        tradeSide: 'OPEN',
+        orderType: params.orderType || 'LIMIT',
+        leverage: params.leverage,
+        marginUsd: params.marginUsd,
+        price: params.orderType === 'LIMIT' && params.limitPrice ? params.limitPrice : curPrice,
+        tpPrice: params.takeProfit1,
+        slPrice: params.stopLoss,
+        stopLoss: params.stopLoss,
+        takeProfit1: params.takeProfit1,
+        takeProfit2: params.takeProfit2,
+        apiKey,
+        secretKey,
+      }).then((res) => {
+        if (res.success) {
+          handleBitunixSync(apiKey, secretKey);
+        } else {
+          console.warn('[Bitunix Gateway Response]', res.message || 'Order failed');
+        }
+      }).catch((e) => console.error('[Bitunix Real Dispatch Error]', e));
+    }
+
+    // Send Telegram Notification for executed trade
+    if (account.telegramNotificationsEnabled) {
+      const sideEmoji = params.side === 'LONG' ? '🟢 LONG' : '🔴 SHORT';
+      const orderTypeBadge = params.orderType === 'LIMIT' ? '🎯 LIMIT ORDER PLACED' : '⚡ MARKET ORDER EXECUTED';
+      const execPrice = params.orderType === 'LIMIT' && params.limitPrice ? params.limitPrice : curPrice;
+      const execMsg = `⚡ <b>REAL 3X BITUNIX TRADE</b> ⚡
+<b>Asset:</b> #${params.symbol}
+<b>Action:</b> OPEN ${sideEmoji} ${params.leverage}X
+<b>Type:</b> ${orderTypeBadge}
+<b>Margin:</b> $${params.marginUsd.toLocaleString()} (Notional: $${notional.toLocaleString()})
+<b>${params.orderType === 'LIMIT' ? 'Limit Entry' : 'Fill Price'}:</b> $${execPrice.toLocaleString()}
+<b>Execution Gateway:</b> ⚡ Bitunix Live Exchange
+
+🎯 <b>Take Profit 1:</b> $${params.takeProfit1.toLocaleString()}
+🔥 <b>Take Profit 2 (Liq Target):</b> $${params.takeProfit2.toLocaleString()}
+🛑 <b>Stop Loss:</b> $${params.stopLoss.toLocaleString()}
+⚡ <b>Consensus:</b> ${params.consensusScore} (${params.confidence}% Confidence)`;
+
+      marketApi.sendTelegramNotification({
+        botToken: account.telegramBotToken,
+        chatId: account.telegramChatId,
+        message: execMsg,
+      }).catch((e) => console.log('[Telegram Exec Alert Error]', e.message));
+    }
+  }, [symbol, ticker, userProfile, account, handleBitunixSync]);
+
+  // Close Position handler & Save to Firestore ClosedTrades
+  const handleClosePosition = useCallback((positionId: string, reason: 'MANUAL' | 'TAKE_PROFIT_1' | 'TAKE_PROFIT_2' | 'STOP_LOSS' | 'LIQUIDATION' = 'MANUAL') => {
+    setActivePositions((prev) => {
+      const pos = prev.find((p) => p.id === positionId);
+      if (!pos) return prev;
+
+      const livePrice =
+        (pos.symbol === symbol ? ticker?.lastPrice : null) ||
+        livePricesRef.current[pos.symbol] ||
+        pos.currentPrice ||
+        pos.entryPrice;
+
+      const isLong = pos.side === 'LONG';
+      const priceDelta = isLong ? (livePrice - pos.entryPrice) : (pos.entryPrice - livePrice);
+      const priceChangeRatio = pos.entryPrice > 0 ? priceDelta / pos.entryPrice : 0;
+      const pnlUsd = pos.sizeUsd * priceChangeRatio;
+      const pnlPercent = priceChangeRatio * pos.leverage * 100;
+      const isWin = pnlUsd > 0;
+
+      const closedItem: ClosedTrade = {
+        id: `closed_${Date.now()}`,
+        symbol: pos.symbol,
+        side: pos.side,
+        entryPrice: pos.entryPrice,
+        exitPrice: livePrice,
+        leverage: pos.leverage,
+        sizeUsd: pos.sizeUsd,
+        marginUsd: pos.marginUsd,
+        pnlUsd,
+        pnlPercent,
+        openTime: pos.openTime,
+        closeTime: Date.now(),
+        closeReason: reason,
+        agentConsensus: pos.agentConsensus,
+      };
+
+      setClosedTrades((old) => [closedItem, ...old.slice(0, 99)]);
+      
+      setAccount((acc) => {
+        const newBalance = acc.balanceUsd + pos.marginUsd + pnlUsd;
+        const newRealizedPnl = acc.totalRealizedPnlUsd + pnlUsd;
+        const updated = {
+          ...acc,
+          balanceUsd: newBalance,
+          totalRealizedPnlUsd: newRealizedPnl,
+          winCount: isWin ? acc.winCount + 1 : acc.winCount,
+          lossCount: !isWin ? acc.lossCount + 1 : acc.lossCount,
+          totalTrades: acc.totalTrades + 1,
+        };
+        if (userProfile?.uid) {
+          saveUserAccount(userProfile.uid, updated, { email: userProfile.email, displayName: userProfile.displayName });
+        }
+        return updated;
+      });
+
+      // Remove from active in Firestore & Save to Trades history
+      if (userProfile?.uid) {
+        removePositionFromFirestore(userProfile.uid, positionId);
+        saveClosedTradeToFirestore(userProfile.uid, closedItem);
+      }
+
+      // Send Telegram Notification for closed trade
+      if (account.telegramNotificationsEnabled) {
+        const outcomeEmoji = isWin ? '✅ <b>WIN (TP HIT)</b>' : '❌ <b>LOSS (SL HIT)</b>';
+        const closeMsg = `🏁 <b>3X POSITION CLOSED</b> 🏁
+<b>Asset:</b> #${pos.symbol} (${pos.side} ${pos.leverage}X)
+<b>Result:</b> ${outcomeEmoji}
+<b>Realized PnL:</b> ${isWin ? '+' : ''}$${pnlUsd.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)
+<b>Exit Reason:</b> ${reason.replace(/_/g, ' ')}
+<b>Entry:</b> $${pos.entryPrice.toLocaleString()} → <b>Exit:</b> $${livePrice.toLocaleString()}`;
+
+        marketApi.sendTelegramNotification({
+          botToken: account.telegramBotToken,
+          chatId: account.telegramChatId,
+          message: closeMsg,
+        }).catch((e) => console.log('[Telegram Close Alert Error]', e.message));
+      }
+
+      return prev.filter((p) => p.id !== positionId);
+    });
+  }, [symbol, ticker, userProfile, account]);
+
+  // Partial Take Profit (Scale 50%)
+  const handlePartialTakeProfit = useCallback((positionId: string) => {
+    setActivePositions((prev) => {
+      return prev.map((pos) => {
+        if (pos.id !== positionId) return pos;
+        
+        const livePrice =
+          (pos.symbol === symbol ? ticker?.lastPrice : null) ||
+          livePricesRef.current[pos.symbol] ||
+          pos.currentPrice ||
+          pos.entryPrice;
+
+        const isLong = pos.side === 'LONG';
+        const priceDelta = isLong ? (livePrice - pos.entryPrice) : (pos.entryPrice - livePrice);
+        const priceChangeRatio = pos.entryPrice > 0 ? priceDelta / pos.entryPrice : 0;
+        const totalPnl = pos.sizeUsd * priceChangeRatio;
+        const halfMargin = pos.marginUsd / 2;
+        const halfPnl = totalPnl / 2;
+        
+        setAccount((acc) => {
+          const updated = {
+            ...acc,
+            balanceUsd: acc.balanceUsd + halfMargin + halfPnl,
+            totalRealizedPnlUsd: acc.totalRealizedPnlUsd + halfPnl,
+          };
+          if (userProfile?.uid) {
+            saveUserAccount(userProfile.uid, updated, { email: userProfile.email, displayName: userProfile.displayName });
+          }
+          return updated;
+        });
+
+        const updatedPos = {
+          ...pos,
+          currentPrice: livePrice,
+          marginUsd: halfMargin,
+          sizeUsd: pos.sizeUsd / 2,
+          tp1Triggered: true,
+          stopLoss: pos.entryPrice, // Move stop loss to breakeven!
+        };
+
+        if (userProfile?.uid) {
+          savePositionToFirestore(userProfile.uid, updatedPos);
+        }
+
+        return updatedPos;
+      });
+    });
+  }, [userProfile]);
+
+  // Move Stop Loss to Breakeven
+  const handleMoveStopToBreakeven = useCallback((positionId: string) => {
+    setActivePositions((prev) => {
+      return prev.map((pos) => {
+        if (pos.id !== positionId) return pos;
+        const updated = {
+          ...pos,
+          stopLoss: pos.entryPrice,
+        };
+        if (userProfile?.uid) {
+          savePositionToFirestore(userProfile.uid, updated);
+        }
+        return updated;
+      });
+    });
+  }, [userProfile]);
+
+  // Update Account Configuration
+  const handleUpdateAccountConfig = useCallback((config: Partial<TraderAccount>) => {
+    setAccount((prev) => {
+      const updated = { ...prev, ...config };
+      if (userProfile?.uid) {
+        saveUserAccount(userProfile.uid, updated, { email: userProfile.email, displayName: userProfile.displayName });
+      }
+      return updated;
+    });
+  }, [userProfile]);
+
+  // Toggle Auto-Trader Mode
+  const handleToggleAutoTrader = useCallback(() => {
+    setAccount((prev) => {
+      const updated = { ...prev, autoTraderActive: !prev.autoTraderActive };
+      if (userProfile?.uid) {
+        saveUserAccount(userProfile.uid, updated, { email: userProfile.email, displayName: userProfile.displayName });
+      }
+      return updated;
+    });
+  }, [userProfile]);
+
+  // Reset Virtual Paper Trading Account
+  const handleResetAccount = useCallback(() => {
+    const defaultAcc: TraderAccount = {
+      balanceUsd: 100000,
+      initialBalanceUsd: 100000,
+      equityUsd: 100000,
+      totalRealizedPnlUsd: 0,
+      winCount: 0,
+      lossCount: 0,
+      totalTrades: 0,
+      autoTraderActive: false,
+      autoTraderMinConfidence: 85,
+      autoTraderDefaultLeverage: 100,
+      autoTraderPositionSizeUsd: 10,
+      executionMode: 'BITUNIX_REAL',
+      bitunixApiKey: '',
+      bitunixSecretKey: '',
+      bitunixConnected: false,
+      bitunixBalanceUsd: 0,
+      bitunixAvailableBalanceUsd: 0,
+    };
+    setActivePositions([]);
+    setClosedTrades([]);
+    setAccount(defaultAcc);
+    if (userProfile?.uid) {
+      saveUserAccount(userProfile.uid, defaultAcc, { email: userProfile.email, displayName: userProfile.displayName });
+    }
+  }, [userProfile]);
+
+  // Compute Live Position Price & PnL across ALL symbols using useMemo
+  const activePositionsWithPnl = useMemo(() => {
+    return activePositions.map((pos) => {
+      // Find latest live price for this position's symbol across current ticker & multi-symbol price stream
+      const curPrice =
+        (pos.symbol === symbol ? ticker?.lastPrice : null) ||
+        livePrices[pos.symbol] ||
+        pos.currentPrice ||
+        pos.entryPrice;
+
+      if (!curPrice || pos.entryPrice <= 0) return pos;
+
+      const isLong = pos.side === 'LONG';
+      const priceDelta = isLong ? (curPrice - pos.entryPrice) : (pos.entryPrice - curPrice);
+      const priceChangeRatio = priceDelta / pos.entryPrice;
+      
+      const unrealizedPnlUsd = pos.sizeUsd * priceChangeRatio;
+      const unrealizedPnlPercent = priceChangeRatio * pos.leverage * 100;
+
+      return {
+        ...pos,
+        currentPrice: curPrice,
+        unrealizedPnlUsd,
+        unrealizedPnlPercent,
+      };
+    });
+  }, [activePositions, ticker?.lastPrice, symbol, livePrices]);
+
+  // Compute Total Account Equity dynamically using useMemo
+  const accountWithEquity = useMemo(() => {
+    const totalUnrealized = activePositionsWithPnl.reduce((acc, pos) => acc + (pos.unrealizedPnlUsd || 0) + pos.marginUsd, 0);
+    return {
+      ...account,
+      equityUsd: account.balanceUsd + totalUnrealized,
+    };
+  }, [account, activePositionsWithPnl]);
+
+  // Auto Take-Profit / Stop-Loss Execution Checker across ALL open positions
+  useEffect(() => {
+    if (activePositionsRef.current.length === 0) return;
+
+    // Check TP/SL Triggers across all active positions
+    activePositionsRef.current.forEach((pos) => {
+      const curPrice =
+        (pos.symbol === symbol ? ticker?.lastPrice : null) ||
+        livePrices[pos.symbol] ||
+        pos.currentPrice;
+
+      if (!curPrice || curPrice <= 0) return;
+      const isLong = pos.side === 'LONG';
+
+      // Stop Loss Hit
+      if (isLong ? curPrice <= pos.stopLoss : curPrice >= pos.stopLoss) {
+        handleClosePosition(pos.id, 'STOP_LOSS');
+      }
+      // Take Profit 2 Hit
+      else if (isLong ? curPrice >= pos.takeProfit2 : curPrice <= pos.takeProfit2) {
+        handleClosePosition(pos.id, 'TAKE_PROFIT_2');
+      }
+      // Take Profit 1 Hit (Auto-scale 50% and trail SL to BE)
+      else if (!pos.tp1Triggered && (isLong ? curPrice >= pos.takeProfit1 : curPrice <= pos.takeProfit1)) {
+        handlePartialTakeProfit(pos.id);
+      }
+    });
+  }, [ticker?.lastPrice, symbol, livePrices, handleClosePosition, handlePartialTakeProfit]);
+
+  // Open Multi-Agent Modal handler
+  const handleOpenMultiAgentTrader = useCallback(() => {
+    setShowMultiAgentModal(true);
+    if (!multiAgentSignal) {
+      handleRequestMultiAgentSignal();
+    }
+  }, [multiAgentSignal, handleRequestMultiAgentSignal]);
+
+  // Reset scalp, multi-agent, truth, price action, and dominant timeframe signal on symbol switch
+  useEffect(() => {
+    setScalpSignal(null);
+    setScalpError(null);
+    setMultiAgentSignal(null);
+    setMultiAgentError(null);
+    setTruthSignal(null);
+    setTruthError(null);
+    setPriceActionSignal(null);
+    setPriceActionError(null);
+    setDominantTfData(null);
+  }, [symbol]);
+
+  // Fetch all market data including Dual-Exchange Ticker and Dual-Depth
+  const loadMarketData = useCallback(async (isInitial = false) => {
+    if (isInitial) setIsLoading(true);
+    const start = performance.now();
+
+    try {
+      // Fetch deep historical candles (1500 for low timeframes, 1000 for high timeframes)
+      const candleLimit = ['1m', '3m', '5m', '15m', '30m'].includes(interval) ? 1500 : 1000;
+      const [fetchedCandles, fetchedDualTicker, fetchedDualDepth, allPrices] = await Promise.all([
+        marketApi.fetchKlines(symbol, interval, candleLimit, venue === 'hyperliquid' ? 'hyperliquid' : 'binance'),
+        marketApi.fetchDualTicker(symbol),
+        marketApi.fetchDualOrderBook(symbol),
+        marketApi.fetchAllPrices(),
+      ]);
+
+      if (!isMountedRef.current) return;
+
+      const duration = Math.round(performance.now() - start);
+      setLatencyMs(duration);
+
+      if (allPrices && Object.keys(allPrices).length > 0) {
+        setLivePrices((prev) => ({ ...prev, ...allPrices }));
+      }
+
+      if (fetchedCandles && fetchedCandles.length > 0) {
+        setCandles(fetchedCandles);
+      }
+
+      if (fetchedDualTicker) {
+        setDualTicker(fetchedDualTicker);
+        if (venue === 'aggregated') {
+          setTicker({
+            ...fetchedDualTicker.binance,
+            openInterestUsd: fetchedDualTicker.aggregatedOI,
+            quoteVolume24h: fetchedDualTicker.aggregatedVol,
+          });
+        } else if (venue === 'hyperliquid') {
+          setTicker(fetchedDualTicker.hyperliquid);
+        } else {
+          setTicker(fetchedDualTicker.binance);
+        }
+      }
+
+      if (fetchedDualDepth) {
+        setDualDepth(fetchedDualDepth);
+        if (venue === 'aggregated' && fetchedDualDepth.aggregated) {
+          setOrderBook(fetchedDualDepth.aggregated);
+        } else if (venue === 'hyperliquid' && fetchedDualDepth.hyperliquid) {
+          setOrderBook(fetchedDualDepth.hyperliquid);
+        } else if (fetchedDualDepth.binance) {
+          setOrderBook(fetchedDualDepth.binance);
+        }
+      }
+    } catch (err) {
+      console.error('Error fetching dual market data:', err);
+    } finally {
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
+    }
+  }, [symbol, interval, venue]);
+
+  // Initial load & periodic polling
+  useEffect(() => {
+    isMountedRef.current = true;
+    loadMarketData(true);
+
+    const intervalId = window.setInterval(() => {
+      loadMarketData(false);
+    }, 4000);
+
+    return () => {
+      isMountedRef.current = false;
+      clearInterval(intervalId);
+    };
+  }, [loadMarketData]);
+
+  // Auto-sync Bitunix positions every 15 seconds if connected
+  useEffect(() => {
+    let syncInterval: number;
+    if (account.bitunixConnected && account.bitunixApiKey && account.bitunixSecretKey) {
+      syncInterval = window.setInterval(() => {
+        handleBitunixSync(account.bitunixApiKey, account.bitunixSecretKey);
+      }, 15000);
+    }
+    return () => {
+      if (syncInterval) clearInterval(syncInterval);
+    };
+  }, [account.bitunixConnected, account.bitunixApiKey, account.bitunixSecretKey, handleBitunixSync]);
+
+  // Setup WebSocket real-time live streaming with automated 5m candle close detection and multi-coin tickers
+  useEffect(() => {
+    marketApi.subscribeWebSocket(symbol, interval, {
+      onCandle: (liveCandle) => {
+        setCandles((prev) => {
+          if (!prev || prev.length === 0) return [liveCandle];
+          const last = prev[prev.length - 1];
+          if (last.time === liveCandle.time) {
+            const copy = [...prev];
+            copy[copy.length - 1] = liveCandle;
+            return copy;
+          } else if (liveCandle.time > last.time) {
+            return [...prev.slice(-1499), liveCandle];
+          }
+          return prev;
+        });
+
+        // Check if a candle just closed and Auto-Trader is enabled
+        if (liveCandle.isClosed) {
+          const candleTime = liveCandle.time;
+          if (candleTime > lastEvaluatedCandleCloseRef.current) {
+            lastEvaluatedCandleCloseRef.current = candleTime;
+            
+            // Trigger 3X Multi-Agent Quant Council auto deliberation if active or modal open
+            if (accountRef.current.autoTraderActive && !isAutoEvaluatingRef.current) {
+              const curPrice = tickerRef.current?.lastPrice || candlesRef.current[candlesRef.current.length - 1]?.close || 0;
+              const topClusters = extractTopClusters(heatmapDataRef.current, curPrice);
+              
+              let isNearLiquidity = false;
+              for (const cl of topClusters) {
+                if (cl.phantomLiquidityRisk === 'HIGH_SPOOF_RISK') continue;
+                const distPercent = Math.abs(cl.price - curPrice) / curPrice;
+                if (distPercent <= 0.015) { // 1.5% proximity
+                  isNearLiquidity = true;
+                  break;
+                }
+              }
+
+              if (true) {
+                isAutoEvaluatingRef.current = true;
+                console.log(`[Auto-Trader] 5m Candle Closed near Liquidity at ${new Date(candleTime).toISOString()} - Triggering AI`);
+                handleRequestMultiAgentSignal().finally(() => {
+                  isAutoEvaluatingRef.current = false;
+                });
+              } else {
+                console.log(`[Auto-Trader] 5m Candle Closed, but price is not near valid Liquidity. Skipping AI.`);
+              }
+            }
+          }
+        }
+      },
+      onTicker: (price) => {
+        setTicker((prev) => {
+          if (!prev) return null;
+          const priceChange = price - (prev.lastPrice - prev.priceChange);
+          const priceChangePercent = ((price - (prev.lastPrice - prev.priceChange)) / (prev.lastPrice - prev.priceChange || 1)) * 100;
+          return {
+            ...prev,
+            lastPrice: price,
+            priceChange,
+            priceChangePercent,
+          };
+        });
+        setLivePrices((prev) => ({ ...prev, [symbol]: price }));
+      },
+      onMultiPrices: (prices) => {
+        setLivePrices((prev) => ({ ...prev, ...prices }));
+      },
+      onLiquidation: (liq) => {
+        setLiquidations((prev) => [liq, ...prev.slice(0, 40)]);
+      },
+    });
+
+    return () => {
+      marketApi.unsubscribeWebSocket();
+    };
+  }, [symbol, interval, handleRequestMultiAgentSignal]);
+
+  // Periodic 1-minute candle-close synchronization safety loop
+  useEffect(() => {
+    if (!account.autoTraderActive) return;
+
+    // Check every 10 seconds if a 1m interval boundary has just elapsed
+    const safetyCheckInterval = window.setInterval(() => {
+      const now = Date.now();
+      const current1mCandleStart = Math.floor(now / (60 * 1000)) * (60 * 1000);
+      const previous1mCandleTime = current1mCandleStart - (60 * 1000);
+
+      // If previous 1m candle closed and hasn't been evaluated yet
+      if (
+        previous1mCandleTime > lastEvaluatedCandleCloseRef.current &&
+        !isAutoEvaluatingRef.current &&
+        accountRef.current.autoTraderActive
+      ) {
+        // Distance Filter: Check if price is within 0.15% of a valid non-phantom liquidity cluster
+        const curPrice = tickerRef.current?.lastPrice || candlesRef.current[candlesRef.current.length - 1]?.close || 0;
+        const topClusters = extractTopClusters(heatmapDataRef.current, curPrice);
+        
+        let isNearLiquidity = false;
+        for (const cl of topClusters) {
+          if (cl.phantomLiquidityRisk === 'HIGH_SPOOF_RISK') continue;
+          const distPercent = Math.abs(cl.price - curPrice) / curPrice;
+          if (distPercent <= 0.015) { // 1.5% proximity
+            isNearLiquidity = true;
+            break;
+          }
+        }
+
+        lastEvaluatedCandleCloseRef.current = previous1mCandleTime;
+
+        if (!isNearLiquidity) {
+          console.log("[Auto-Trader] Price is not within 0.15% of a stable Liquidity Cluster. Skipping AI processing.");
+          return;
+        }
+
+        isAutoEvaluatingRef.current = true;
+        console.log(`[Auto-Trader] Liquidity zone detected at 5-Minute Candle Close. Triggering AI processing...`);
+        handleRequestMultiAgentSignal().finally(() => {
+          isAutoEvaluatingRef.current = false;
+        });
+      }
+    }, 10000);
+
+    return () => {
+      clearInterval(safetyCheckInterval);
+    };
+  }, [account.autoTraderActive, handleRequestMultiAgentSignal]);
+
+  // Compute Heatmap Matrix when candles, orderbook, or leverage filters change
+  useEffect(() => {
+    if (candles.length === 0) return;
+
+    const data = computeLiquidityHeatmap({
+      candles,
+      orderBook,
+      leverageFilter,
+      intensitySensitivity,
+      priceSteps: 170,
+    });
+
+    setHeatmapData(data);
+  }, [candles, orderBook, leverageFilter, intensitySensitivity]);
+
+  return (
+    <div id="liquidity-terminal-app" className="w-screen h-screen bg-[#0a0b12] text-slate-100 overflow-hidden font-sans select-none relative">
+      <HeatmapChart
+        candles={candles}
+        orderBook={orderBook}
+        heatmapData={heatmapData}
+        ticker={ticker}
+        dualTicker={dualTicker}
+        dualDepth={dualDepth}
+        colorPreset={colorPreset}
+        onColorPresetChange={setColorPreset}
+        intensitySensitivity={intensitySensitivity}
+        onIntensityChange={setIntensitySensitivity}
+        showCandles={showCandles}
+        onToggleCandles={() => setShowCandles(!showCandles)}
+        showHeatmap={showHeatmap}
+        onToggleHeatmap={() => setShowHeatmap(!showHeatmap)}
+        showDepthProfile={showDepthProfile}
+        onToggleDepthProfile={() => setShowDepthProfile(!showDepthProfile)}
+        showVolumeProfile={showVolumeProfile}
+        onToggleVolumeProfile={() => setShowVolumeProfile(!showVolumeProfile)}
+        symbol={symbol}
+        onSymbolChange={setSymbol}
+        interval={interval}
+        onIntervalChange={setInterval}
+        venue={venue}
+        onVenueChange={setVenue}
+        leverageFilter={leverageFilter}
+        onLeverageFilterChange={setLeverageFilter}
+        isLoading={isLoading}
+        onRefresh={() => loadMarketData(true)}
+        latencyMs={latencyMs}
+        scalpSignal={scalpSignal}
+        isScalpLoading={isScalpLoading}
+        scalpError={scalpError}
+        showScalpCard={showScalpCard}
+        onToggleScalpCard={() => setShowScalpCard(!showScalpCard)}
+        onRequestScalpSignal={handleRequestScalpSignal}
+        showScalpOverlay={showScalpOverlay}
+        onToggleScalpOverlay={() => setShowScalpOverlay(!showScalpOverlay)}
+        onOpenMultiAgentTrader={handleOpenMultiAgentTrader}
+        multiAgentSignal={multiAgentSignal}
+        activePositions={activePositionsWithPnl}
+        truthSignal={truthSignal}
+        isTruthLoading={isTruthLoading}
+        truthError={truthError}
+        showTruthCard={showTruthCard}
+        onToggleTruthCard={() => setShowTruthCard(!showTruthCard)}
+        onRequestTruthSignal={handleRequestTruthAISignal}
+        priceActionSignal={priceActionSignal}
+        isPriceActionLoading={isPriceActionLoading}
+        priceActionError={priceActionError}
+        showPriceActionCard={showPriceActionCard}
+        onTogglePriceActionCard={() => setShowPriceActionCard(!showPriceActionCard)}
+        onRequestPriceActionSignal={handleRequestPriceActionSignal}
+        showPriceActionOverlay={showPriceActionOverlay}
+        onTogglePriceActionOverlay={() => setShowPriceActionOverlay(!showPriceActionOverlay)}
+        dominantTfData={dominantTfData}
+        isDominantTfLoading={isDominantTfLoading}
+        onRequestDominantTf={handleRequestDominantTf}
+      />
+
+      {/* 3X Multi-Agent Quant Triad Modal & Execution Terminal */}
+      {showMultiAgentModal && (
+        <MultiAgentTraderModal
+          signal={multiAgentSignal}
+          isLoading={isMultiAgentLoading}
+          error={multiAgentError}
+          onRefresh={handleRequestMultiAgentSignal}
+          onClose={() => setShowMultiAgentModal(false)}
+          symbol={symbol}
+          ticker={ticker}
+          recentCandles={candles}
+          newsSignal={newsSignal}
+          isNewsLoading={isNewsLoading}
+          onRefreshNews={() => handleFetchCryptoNews(symbol)}
+          userProfile={userProfile}
+          onSignInGoogle={handleSignInGoogle}
+          onSignOut={handleSignOut}
+          firestoreStatus={firestoreStatus}
+          activePositions={activePositionsWithPnl}
+          closedTrades={closedTrades}
+          account={accountWithEquity}
+          onExecuteTrade={handleExecuteTrade}
+          onClosePosition={handleClosePosition}
+          onPartialTakeProfit={handlePartialTakeProfit}
+          onMoveStopToBreakeven={handleMoveStopToBreakeven}
+          onToggleAutoTrader={handleToggleAutoTrader}
+          onUpdateAccountConfig={handleUpdateAccountConfig}
+          onResetAccount={handleResetAccount}
+          bitunixAccountInfo={bitunixAccountInfo}
+          bitunixPositions={bitunixPositions}
+          isBitunixSyncing={isBitunixSyncing}
+          onBitunixSync={handleBitunixSync}
+          onBitunixPlaceOrder={handleBitunixPlaceOrder}
+          onBitunixClosePosition={handleBitunixClosePosition}
+          onBitunixTestConnection={marketApi.testBitunixConnection}
+        />
+      )}
+    </div>
+  );
+}

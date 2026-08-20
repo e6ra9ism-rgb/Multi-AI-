@@ -1,0 +1,8 @@
+{
+  "name": "Remix Multi ai Web3 Liquidity Heatmap Terminal",
+  "description": "Professional Web3 crypto terminal with real-time liquidity heatmaps, orderbook depth profiles, and 4-Agent Quant Council (Price Action Master, Truth AI, AI Scalper, and Dominant Timeframe AI) with Bitunix execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
